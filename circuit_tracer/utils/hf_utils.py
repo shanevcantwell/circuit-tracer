@@ -1,12 +1,16 @@
 from __future__ import annotations
+import logging
 
-from typing import Dict, Iterable, NamedTuple, Optional
+from typing import Dict, Iterable, NamedTuple, Optional, Dict
 from urllib.parse import parse_qs, urlparse
 
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, get_token, hf_api
 from huggingface_hub.constants import HF_HUB_ENABLE_HF_TRANSFER
 from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
+from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm.contrib.concurrent import thread_map
+
+logger = logging.getLogger(__name__)
 
 
 class HfUri(NamedTuple):
@@ -49,14 +53,12 @@ def download_hf_uri(uri: str) -> str:
         force_download=False,
     )
 
-
 def download_hf_uris(uris: Iterable[str], max_workers: int = 8) -> Dict[str, str]:
-    """Download multiple HuggingFace URIs concurrently.
+    """Download multiple HuggingFace URIs concurrently with pre-flight auth checks.
 
     Args:
         uris: Iterable of HF URIs.
-        max_workers: Maximum number of parallel workers when HF transfer is
-            disabled. Ignored otherwise.
+        max_workers: Maximum number of parallel workers.
 
     Returns:
         Mapping from input URI to the local file path on disk.
@@ -64,25 +66,47 @@ def download_hf_uris(uris: Iterable[str], max_workers: int = 8) -> Dict[str, str
     if not uris:
         return {}
 
-    parsed_map = {uri: parse_hf_uri(uri) for uri in uris}
+    uri_list = list(uris)
+    if not uri_list:
+        return {}
+    parsed_map = {uri: parse_hf_uri(uri) for uri in uri_list}
+
+    # ---  Pre-flight Check ---
+    logger.info("Performing pre-flight metadata check...")
+    unique_repos = {info.repo_id for info in parsed_map.values()}
+    token = get_token()
+
+    for repo_id in unique_repos:
+        if hf_api.repo_info(repo_id=repo_id, token=token).gated != False:
+            if token is None:
+                raise PermissionError("Cannot access a gated repo without a hf token.")
+
+    logger.info("Pre-flight check complete. Starting downloads...")
 
     def _download(uri: str) -> str:
         info = parsed_map[uri]
+
         return hf_hub_download(
             repo_id=info.repo_id,
             filename=info.file_path,
             revision=info.revision,
+            token=token,
             force_download=False,
         )
 
     if HF_HUB_ENABLE_HF_TRANSFER:
-        return {uri: _download(uri) for uri in uris}
+        # Use a simple loop for sequential download if HF_TRANSFER is enabled
+        results = [_download(uri) for uri in uri_list]
+        return dict(zip(uri_list, results))
 
+    # The thread_map will attempt all downloads in parallel. If any worker thread
+    # raises an exception (like GatedRepoError from _download), thread_map
+    # will propagate that first exception, failing the entire process.
     results = thread_map(
         _download,
-        list(uris),
+        uri_list,
         desc=f"Fetching {len(parsed_map)} files",
         max_workers=max_workers,
         tqdm_class=hf_tqdm,
     )
-    return dict(zip(uris, results))
+    return dict(zip(uri_list, results))
